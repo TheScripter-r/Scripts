@@ -1,0 +1,482 @@
+-- =========================================================
+-- Mount LONELY — Auto Summit v37
+-- Faster escape (bigger jumps, quicker trigger)
+-- =========================================================
+
+local PATH_URL = "https://raw.githubusercontent.com/TheScripter-r/Scripts/refs/heads/main/path.txt"
+
+local Fluent = loadstring(game:HttpGet(
+    "https://github.com/StyearX/Fluent-modded/releases/download/1.5.1/FluentPro"
+))()
+
+local RunService = game:GetService("RunService")
+local Players    = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+local S = {
+    Enabled        = false,
+    Loop           = false,
+    TrackIdx       = 1,
+    LastProgressIdx = 1,
+    LastProgressAt = 0,
+    LastEscapeIdx  = 0,
+    Conn           = nil,
+    MoveConn       = nil,
+    Frames         = 0,
+    DiagAt         = 0,
+    WalkSpeed      = 200,
+    JumpPower      = 100,
+    LookAhead      = 8,
+    MoveDir        = Vector3.zero,
+    JumpEnabled    = true,
+    JumpInterval   = 0.18,
+    LastJumpAt     = 0,
+    JumpCount      = 0,
+    AltitudeCap    = 12,
+    EscapeLevel    = 0,
+    LastEscapeAt   = 0,
+    EscapeCooldown = 0.6,
+    EscapeCount    = 0,
+    StallTrigger   = 1.0,
+    ResetDistance  = 150,      -- must progress this many frames past last escape to reset level
+    PostEscapeLock = 1.0,
+    Jumps          = {},
+    State          = "waiting",
+    WaitStart      = 0,
+}
+
+-- Bigger first jump: usually gets past 2-3 tight obstacles in one go
+local ESCAPE_DIST = { 50, 100, 200, 350, 500 }
+
+local Path = {}
+local Loaded = false
+local LoadErr = ""
+
+local function log(...) print("[AutoSummit]", ...) end
+
+local function parsePath(raw)
+    local out = {}
+    for line in raw:gmatch("[^\r\n]+") do
+        local t, px, py, pz = line:match(
+            "t=([%-%d%.]+)%s*,%s*p=Vector3%.new%(([%-%d%.]+)%s*,%s*([%-%d%.]+)%s*,%s*([%-%d%.]+)%)")
+        if t then
+            out[#out+1] = { t = tonumber(t), p = Vector3.new(tonumber(px), tonumber(py), tonumber(pz)) }
+        end
+    end
+    return out
+end
+
+local function detectJumps(path)
+    local ev = {}
+    local n = #path
+    local i = 2
+    while i <= n - 1 do
+        local dy = path[i].p.Y - path[i-1].p.Y
+        local dt = path[i].t - path[i-1].t
+        if dt > 0 and dy/dt > 20 and dy/dt < 200 then
+            ev[#ev+1] = { idx = i, fired = false }
+            local stop = path[i].t + 0.4
+            while i <= n and path[i].t < stop do i = i + 1 end
+        else
+            i = i + 1
+        end
+    end
+    return ev
+end
+
+local function loadData()
+    log("Downloading path...")
+    local ok, raw = pcall(function() return game:HttpGet(PATH_URL, true) end)
+    if not ok or not raw then LoadErr = "HttpGet failed"; return false end
+    Path = parsePath(raw)
+    if #Path == 0 then LoadErr = "Parsed 0 frames"; return false end
+    S.Jumps = detectJumps(Path)
+    Loaded = true
+    LoadErr = ""
+    log(string.format("Loaded %d frames (%.1fs), %d jumps.",
+        #Path, Path[#Path].t, #S.Jumps))
+    return true
+end
+
+local function nearestFrame(pos, hintIdx, wide)
+    local win = wide and 200 or 30
+    local lo = math.max(1, (hintIdx or 1) - win)
+    local hi = math.min(#Path, (hintIdx or 1) + win)
+    local bestI, bestD = lo, math.huge
+    for i = lo, hi do
+        local d = (Path[i].p - pos).Magnitude
+        if d < bestD then bestD = d; bestI = i end
+    end
+    return bestI, bestD
+end
+
+local function fullNearestFrame(pos)
+    local bestI, bestD = 1, math.huge
+    for i = 1, #Path, 3 do
+        local d = (Path[i].p - pos).Magnitude
+        if d < bestD then bestD = d; bestI = i end
+    end
+    return bestI, bestD
+end
+
+local function forceJump(hh)
+    pcall(function() hh.Jump = true end)
+    pcall(function() hh:ChangeState(Enum.HumanoidStateType.Jumping) end)
+end
+
+local function pickHorizTarget(fromPos, startIdx, extraSkip, minHoriz)
+    local start = math.min(startIdx + extraSkip, #Path)
+    for i = start, math.min(#Path, start + 60) do
+        local p = Path[i].p
+        local delta = p - fromPos
+        local horiz = Vector3.new(delta.X, 0, delta.Z).Magnitude
+        if horiz >= minHoriz then return i end
+    end
+    return math.min(#Path, start + 60)
+end
+
+local function stopPlayback()
+    log(string.format("Stopped. Frames: %d, Jumps: %d, Escapes: %d",
+        S.Frames, S.JumpCount, S.EscapeCount))
+    S.Enabled = false
+    if S.Conn then S.Conn:Disconnect(); S.Conn = nil end
+    if S.MoveConn then S.MoveConn:Disconnect(); S.MoveConn = nil end
+    local c = LocalPlayer.Character
+    if c then
+        local h = c:FindFirstChildOfClass("Humanoid")
+        if h then h.WalkSpeed = 16; h.JumpPower = 50; h:Move(Vector3.zero) end
+    end
+    for _, ev in ipairs(S.Jumps) do ev.fired = false end
+    S.State = "waiting"
+end
+
+local function heartbeatBody()
+    local now = os.clock()
+    if not S.Enabled then return end
+
+    local c = LocalPlayer.Character
+    if not c then return end
+    local h  = c:FindFirstChild("HumanoidRootPart")
+    local hh = c:FindFirstChildOfClass("Humanoid")
+    if not h or not hh then return end
+
+    local myPos = h.Position
+    local state = hh:GetState()
+
+    if S.State == "waiting" then
+        if (now - S.WaitStart) < 3 then return end
+        local onGround = (state == Enum.HumanoidStateType.Running
+                      or state == Enum.HumanoidStateType.RunningNoPhysics
+                      or state == Enum.HumanoidStateType.Landed
+                      or state == Enum.HumanoidStateType.Seated
+                      or state == Enum.HumanoidStateType.Standing)
+        if onGround then
+            hh.WalkSpeed     = tonumber(S.WalkSpeed) or 200
+            hh.UseJumpPower  = true
+            hh.JumpPower     = tonumber(S.JumpPower) or 100
+            hh.PlatformStand = false
+            hh.AutoRotate    = true
+            S.TrackIdx = fullNearestFrame(myPos)
+            S.LastProgressIdx = S.TrackIdx
+            S.LastProgressAt  = now
+            S.State = "following"
+            log("Following from idx " .. S.TrackIdx)
+        end
+        return
+    end
+
+    local wideSearch = (S.EscapeLevel > 0)
+    local nearIdx = nearestFrame(myPos, S.TrackIdx, wideSearch)
+    if nearIdx > S.TrackIdx then S.TrackIdx = nearIdx end
+
+    -- ═══ TrackIdx progress tracking ═══
+    if S.TrackIdx > S.LastProgressIdx then
+        S.LastProgressIdx = S.TrackIdx
+        S.LastProgressAt  = now
+
+        -- Reset escape level ONLY after significant progress past last escape
+        if S.EscapeLevel > 0 then
+            local framesSinceEscape = S.TrackIdx - S.LastEscapeIdx
+            if framesSinceEscape > S.ResetDistance then
+                S.EscapeLevel = 0
+                S.LastEscapeIdx = 0
+            end
+        end
+    end
+
+    local stalledFor = now - S.LastProgressAt
+    local stallTrigger = tonumber(S.StallTrigger) or 1.0
+    local escapeCooldown = tonumber(S.EscapeCooldown) or 0.6
+    local postLock = tonumber(S.PostEscapeLock) or 1.0
+
+    -- ═══ Escape ═══
+    if stalledFor > stallTrigger
+       and (now - S.LastEscapeAt) > escapeCooldown
+       and (now - S.LastEscapeAt) > postLock then
+
+        S.EscapeLevel = math.min(S.EscapeLevel + 1, #ESCAPE_DIST)
+        local adv = ESCAPE_DIST[S.EscapeLevel]
+
+        -- Find escape target, but skip past any teleport frames
+        local targetIdx = math.min(S.TrackIdx + adv, #Path)
+        local escapes = 0
+        while targetIdx < #Path and escapes < 5 do
+            local jump = math.abs(Path[targetIdx + 1].p.Y - Path[targetIdx].p.Y)
+            if jump > 50 then
+                -- Landing spot is right before a teleport; push past it
+                targetIdx = math.min(targetIdx + 30, #Path)
+                escapes = escapes + 1
+            else
+                break
+            end
+        end
+
+        local tpPos = Path[targetIdx].p
+        local pathY = Path[S.TrackIdx].p.Y
+        local altOffset = math.clamp(myPos.Y - pathY, 5, 15)   -- cap at 15 studs
+        local dest = Vector3.new(tpPos.X, tpPos.Y + altOffset, tpPos.Z)
+
+        pcall(function() h.CFrame = CFrame.new(dest) end)
+        pcall(function()
+            h.AssemblyLinearVelocity = Vector3.zero
+            h.AssemblyAngularVelocity = Vector3.zero
+        end)
+
+        S.LastEscapeAt   = now
+        S.EscapeCount    = S.EscapeCount + 1
+        S.LastProgressIdx = targetIdx
+        S.LastProgressAt  = now
+        S.LastEscapeIdx   = targetIdx
+        S.TrackIdx       = targetIdx
+
+        log(string.format(
+            "[ESCAPE-L%d] stall %.1fs → +%d frames to idx=%d",
+            S.EscapeLevel, stalledFor, adv, targetIdx))
+        return
+    end
+
+    local pathY = Path[S.TrackIdx].p.Y
+    local altAbove = myPos.Y - pathY
+
+    local baseAhead = S.TrackIdx + tonumber(S.LookAhead) or S.TrackIdx + 8
+    local targetIdx = pickHorizTarget(myPos, baseAhead, 0, 1.5)
+    local target = Path[targetIdx].p
+
+    local delta = target - myPos
+    local horiz = Vector3.new(delta.X, 0, delta.Z)
+    if horiz.Magnitude > 0.5 then
+        S.MoveDir = horiz.Unit
+    else
+        S.MoveDir = Vector3.zero
+    end
+
+    S.Frames = S.Frames + 1
+    if hh.WalkSpeed ~= S.WalkSpeed then hh.WalkSpeed = tonumber(S.WalkSpeed) or 200 end
+
+    local altCap = tonumber(S.AltitudeCap) or 12
+    local jumpInterval = tonumber(S.JumpInterval) or 0.18
+
+    if S.JumpEnabled
+       and altAbove < altCap
+       and (now - S.LastJumpAt) > jumpInterval then
+        forceJump(hh)
+        S.LastJumpAt = now
+        S.JumpCount = S.JumpCount + 1
+    end
+
+    for _, ev in ipairs(S.Jumps) do
+        if not ev.fired and S.TrackIdx >= ev.idx and altAbove < altCap then
+            ev.fired = true
+            forceJump(hh)
+        end
+    end
+
+    if S.TrackIdx >= #Path - 3 then
+        if S.Loop then
+            S.TrackIdx = fullNearestFrame(myPos)
+            S.LastProgressIdx = S.TrackIdx
+            S.LastProgressAt = now
+            S.EscapeLevel = 0
+            S.LastEscapeIdx = 0
+            for _, ev in ipairs(S.Jumps) do ev.fired = false end
+            return
+        else
+            log("End."); stopPlayback(); return
+        end
+    end
+
+    if (now - S.DiagAt) >= 1 then
+        S.DiagAt = now
+        local pct = math.floor(S.TrackIdx / #Path * 100)
+        log(string.format(
+            "idx=%d (%d%%) pos=(%.1f,%.1f,%.1f) alt=%+.1f dir=(%.2f,%.2f) stalled=%.1fs L%d esc=%d",
+            S.TrackIdx, pct,
+            myPos.X, myPos.Y, myPos.Z,
+            altAbove, S.MoveDir.X, S.MoveDir.Z,
+            stalledFor, S.EscapeLevel, S.EscapeCount))
+    end
+end
+
+local function startPlayback()
+    if S.Enabled then return end
+    local c = LocalPlayer.Character
+    if not c then log("No character."); return end
+
+    for _, ev in ipairs(S.Jumps) do ev.fired = false end
+
+    S.Enabled         = true
+    S.State           = "waiting"
+    S.WaitStart       = os.clock()
+    S.Frames          = 0
+    S.DiagAt          = 0
+    S.TrackIdx        = 1
+    S.LastProgressIdx = 1
+    S.LastProgressAt  = os.clock()
+    S.LastEscapeIdx   = 0
+    S.JumpCount       = 0
+    S.LastJumpAt      = 0
+    S.MoveDir         = Vector3.zero
+    S.LastEscapeAt    = 0
+    S.EscapeLevel     = 0
+    S.EscapeCount     = 0
+
+    log("Waiting 3s for map...")
+
+    S.MoveConn = RunService.RenderStepped:Connect(function()
+        if not S.Enabled or S.State ~= "following" then return end
+        local cc = LocalPlayer.Character
+        if not cc then return end
+        local hhh = cc:FindFirstChildOfClass("Humanoid")
+        if not hhh then return end
+        if S.MoveDir.Magnitude > 0.05 then
+            hhh:Move(S.MoveDir, false)
+        else
+            hhh:Move(Vector3.zero, false)
+        end
+    end)
+
+    S.Conn = RunService.Heartbeat:Connect(function()
+        local ok, err = xpcall(heartbeatBody, function(e)
+            return tostring(e) .. "\n" .. debug.traceback("", 2)
+        end)
+        if not ok then
+            warn("[AutoSummit] Error:", err)
+        end
+    end)
+
+    log("Playback started (fast escape).")
+end
+
+-- ═══ UI ═══
+local Window = Fluent:CreateWindow({
+    Title       = "Mount LONELY — Auto Summit v37",
+    SubTitle    = "Fast & Smooth Escape",
+    TabWidth    = 160,
+    Size        = UDim2.fromOffset(540, 540),
+    Acrylic     = false,
+    Theme       = "Neon Purple",
+    MinimizeKey = Enum.KeyCode.LeftAlt,
+})
+
+local Tab = Window:AddTab({ Title = "Playback", Icon = "play" })
+
+Tab:AddParagraph({
+    Title   = "v37",
+    Content = "Bigger first escape (50), faster trigger (1s), quicker cooldown (0.6s). Adaptive level reset only after 150 frames progress.",
+})
+
+local statusPara = Tab:AddParagraph({ Title = "Status", Content = "Initializing..." })
+
+local PlayToggle
+PlayToggle = Tab:AddToggle("PlayToggle", {
+    Title = "▶ Play Path", Default = false,
+    Callback = function(enabled)
+        if enabled then
+            if not Loaded and not loadData() then
+                Fluent:Notify({ Title = "AutoSummit", Content = "Load failed: " .. LoadErr, Duration = 4 })
+                pcall(function() PlayToggle:SetValue(false) end)
+                return
+            end
+            startPlayback()
+        else
+            stopPlayback()
+        end
+    end,
+})
+
+Tab:AddToggle("LoopToggle", { Title = "🔁 Loop", Default = false,
+    Callback = function(e) S.Loop = e end })
+
+Tab:AddToggle("JumpToggle", { Title = "🦘 Infinite Jump", Default = true,
+    Callback = function(e) S.JumpEnabled = e end })
+
+Tab:AddSlider("WalkSpeedSlider", {
+    Title = "WalkSpeed", Default = 60, Min = 16, Max = 300, Rounding = 0,
+    Callback = function(v) S.WalkSpeed = tonumber(v) or 200 end,
+})
+
+Tab:AddSlider("JumpPowerSlider", {
+    Title = "JumpPower", Default = 40, Min = 1, Max = 300, Rounding = 0,
+    Callback = function(v) S.JumpPower = tonumber(v) or 100 end,
+})
+
+Tab:AddSlider("AltitudeCapSlider", {
+    Title = "Altitude Cap (studs)", Default = 12, Min = 5, Max = 60, Rounding = 0,
+    Callback = function(v) S.AltitudeCap = tonumber(v) or 12 end,
+})
+
+Tab:AddSlider("StallTriggerSlider", {
+    Title = "Stall Time (s)", Default = 1.0, Min = 0.4, Max = 5.0, Rounding = 1,
+    Callback = function(v) S.StallTrigger = tonumber(v) or 1.0 end,
+})
+
+Tab:AddSlider("EscapeCooldownSlider", {
+    Title = "Escape Cooldown (s)", Default = 0.6, Min = 0.2, Max = 3.0, Rounding = 2,
+    Callback = function(v) S.EscapeCooldown = tonumber(v) or 0.6 end,
+})
+
+Tab:AddSlider("ResetDistanceSlider", {
+    Title = "Level Reset Distance (frames)", Description = "Progress needed past last escape to reset level.",
+    Default = 150, Min = 30, Max = 500, Rounding = 0,
+    Callback = function(v) S.ResetDistance = tonumber(v) or 150 end,
+})
+
+Tab:AddSlider("LookAheadSlider", {
+    Title = "Look-ahead (frames)", Default = 8, Min = 2, Max = 30, Rounding = 0,
+    Callback = function(v) S.LookAhead = tonumber(v) or 8 end,
+})
+
+Tab:AddButton({ Title = "🔄 Reload Path", Callback = function()
+    Loaded = false; Path = {}
+    if loadData() then
+        Fluent:Notify({ Title = "AutoSummit", Content = "Loaded " .. #Path .. " frames.", Duration = 3 })
+    else
+        Fluent:Notify({ Title = "AutoSummit", Content = "Load failed: " .. LoadErr, Duration = 4 })
+    end
+end })
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if not Loaded then
+            statusPara:SetDesc("Not loaded. " .. LoadErr)
+        elseif S.Enabled then
+            local pct = math.floor(S.TrackIdx / #Path * 100)
+            statusPara:SetDesc(string.format("▶ %d%% idx=%d L%d esc=%d",
+                pct, S.TrackIdx, S.EscapeLevel, S.EscapeCount))
+        else
+            statusPara:SetDesc(string.format("Idle. %d frames.", #Path))
+        end
+    end
+end)
+
+task.spawn(function()
+    task.wait(1)
+    loadData()
+end)
+
+LocalPlayer.CharacterAdded:Connect(function()
+    if S.Enabled then task.wait(1); stopPlayback() end
+end)
+
+Fluent:Notify({ Title = "Auto Summit v37", Content = "Fast escape. Watch for [ESCAPE-L#].", Duration = 5 })
