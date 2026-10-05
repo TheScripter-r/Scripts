@@ -1,6 +1,5 @@
 -- =========================================================
--- Mount LONELY — Auto Summit v37
--- Faster escape (bigger jumps, quicker trigger)
+-- Mount LONELY — Auto Summit v44 (Polished)
 -- =========================================================
 
 local PATH_URL = "https://raw.githubusercontent.com/TheScripter-r/Scripts/refs/heads/main/path.txt"
@@ -9,9 +8,38 @@ local Fluent = loadstring(game:HttpGet(
     "https://github.com/StyearX/Fluent-modded/releases/download/1.5.1/FluentPro"
 ))()
 
-local RunService = game:GetService("RunService")
-local Players    = game:GetService("Players")
+local RunService  = game:GetService("RunService")
+local Players     = game:GetService("Players")
+local CoreGui     = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
+
+local CHECKPOINTS = {
+    [0]  = Vector3.new(-1, 8, 86),
+    [1]  = Vector3.new(-122, 100, -1380),
+    [2]  = Vector3.new(515, 113, -1833),
+    [3]  = Vector3.new(1148, 18, -1801),
+    [4]  = Vector3.new(2175, 17, -2185),
+    [5]  = Vector3.new(2212, 352, -2450),
+    [6]  = Vector3.new(1969, 385, -3495),
+    [7]  = Vector3.new(1142, 457, -3770),
+    [8]  = Vector3.new(423, 409, -3570),
+    [9]  = Vector3.new(-178, 429, -3780),
+    [10] = Vector3.new(-880, 435, -4187),
+    [11] = Vector3.new(-1484, 679, -3863),
+    [12] = Vector3.new(-1682, 1110, -3869),
+    [13] = Vector3.new(-2475, 930, -4491),
+    [14] = Vector3.new(-3080, 931, -5123),
+    [15] = Vector3.new(-3859, 964, -5654),
+    [16] = Vector3.new(-4119, 998, -4839),
+    [17] = Vector3.new(-4237, 1240, -3864),
+    [18] = Vector3.new(-3756, 1375, -3357),
+    [19] = Vector3.new(-3750, 1675, -3105),
+    [20] = Vector3.new(-3717, 1722, -2438),
+    [21] = Vector3.new(-3412, 1819, -1917),
+    [22] = Vector3.new(-3360, 1833, -1934),
+}
+local MAX_CP   = 22
+local RESET_CP = 22
 
 local S = {
     Enabled        = false,
@@ -24,6 +52,7 @@ local S = {
     MoveConn       = nil,
     Frames         = 0,
     DiagAt         = 0,
+    -- movement
     WalkSpeed      = 200,
     JumpPower      = 100,
     LookAhead      = 8,
@@ -33,19 +62,52 @@ local S = {
     LastJumpAt     = 0,
     JumpCount      = 0,
     AltitudeCap    = 12,
+    -- escape
     EscapeLevel    = 0,
     LastEscapeAt   = 0,
     EscapeCooldown = 0.6,
     EscapeCount    = 0,
     StallTrigger   = 1.0,
-    ResetDistance  = 150,      -- must progress this many frames past last escape to reset level
-    PostEscapeLock = 1.0,
+    ResetDistance  = 150,
     Jumps          = {},
+    -- state
     State          = "waiting",
     WaitStart      = 0,
+    CPIdxs         = {},
+    ExpectedCP     = 1,
+    RegisteredCount = 0,
+    -- pause
+    PauseCPPos     = nil,
+    PauseCPNumber  = nil,
+    PauseStartTime = 0,
+    PausePollAt    = 0,
+    PauseLastWarn  = 0,
+    PauseTimeout   = 60,
+    PausePhase     = "approach",
+    PauseHoldStart = 0,
+    PauseHoldDur   = 2.0,
+    -- search
+    SearchAngle    = 0,
+    SearchCircles  = 0,
+    SearchBaseR    = 2.0,
+    SearchStepR    = 2.0,
+    SearchMaxR     = 14.0,
+    SearchAngSpeed = 3.0,
+    SearchLastTick = 0,
+    -- reanchor
+    ResetWaitStart = 0,
+    ResetWaitMax   = 30,
+    ResetArriveDist = 40,
+    -- vertical zones
+    VerticalZones  = {},
+    CurrentVerticalZone = nil,
+    JumpPowerSaved = 100,
+    AltitudeCapSaved = 12,
+    VZ_Window      = 40,
+    VZ_MinDY       = 25,
+    VZ_MaxDH       = 15,
 }
 
--- Bigger first jump: usually gets past 2-3 tight obstacles in one go
 local ESCAPE_DIST = { 50, 100, 200, 350, 500 }
 
 local Path = {}
@@ -54,6 +116,9 @@ local LoadErr = ""
 
 local function log(...) print("[AutoSummit]", ...) end
 
+-- ═══════════════════════════════════════════════════════
+-- PARSE / LOAD
+-- ═══════════════════════════════════════════════════════
 local function parsePath(raw)
     local out = {}
     for line in raw:gmatch("[^\r\n]+") do
@@ -66,22 +131,50 @@ local function parsePath(raw)
     return out
 end
 
-local function detectJumps(path)
-    local ev = {}
+local function computeCPIdxs()
+    local out = {}
+    for cp = 0, MAX_CP do
+        local pos = CHECKPOINTS[cp]
+        local bestI, bestD = 1, math.huge
+        for i = 1, #Path do
+            local d = (Path[i].p - pos).Magnitude
+            if d < bestD then bestD = d; bestI = i end
+        end
+        out[cp] = { idx = bestI, dist = bestD, pos = pos }
+    end
+    return out
+end
+
+local function detectVerticalZones(path)
+    local zones = {}
     local n = #path
-    local i = 2
-    while i <= n - 1 do
-        local dy = path[i].p.Y - path[i-1].p.Y
-        local dt = path[i].t - path[i-1].t
-        if dt > 0 and dy/dt > 20 and dy/dt < 200 then
-            ev[#ev+1] = { idx = i, fired = false }
-            local stop = path[i].t + 0.4
-            while i <= n and path[i].t < stop do i = i + 1 end
-        else
-            i = i + 1
+    if n < 60 then return zones end
+    local WINDOW = S.VZ_Window
+    local MIN_DY = S.VZ_MinDY
+    local MAX_DH = S.VZ_MaxDH
+
+    local member = {}
+    for i = 1, n - WINDOW do
+        local p1 = path[i].p
+        local p2 = path[i + WINDOW].p
+        local dY = math.abs(p2.Y - p1.Y)
+        local dx, dz = p2.X - p1.X, p2.Z - p1.Z
+        local dH = math.sqrt(dx*dx + dz*dz)
+        if dY >= MIN_DY and dH <= MAX_DH then
+            for j = i, math.min(n, i + WINDOW) do member[j] = true end
         end
     end
-    return ev
+
+    local inZone, startIdx = false, nil
+    for i = 1, n do
+        if member[i] and not inZone then inZone = true; startIdx = i
+        elseif not member[i] and inZone then
+            inZone = false
+            zones[#zones+1] = { startIdx = startIdx, endIdx = i - 1 }
+        end
+    end
+    if inZone then zones[#zones+1] = { startIdx = startIdx, endIdx = n } end
+    return zones
 end
 
 local function loadData()
@@ -90,14 +183,56 @@ local function loadData()
     if not ok or not raw then LoadErr = "HttpGet failed"; return false end
     Path = parsePath(raw)
     if #Path == 0 then LoadErr = "Parsed 0 frames"; return false end
-    S.Jumps = detectJumps(Path)
+
+    S.CPIdxs = computeCPIdxs()
+    log(string.format("Loaded %d frames (%.1fs).", #Path, Path[#Path].t))
+    for cp = 0, MAX_CP do
+        local e = S.CPIdxs[cp]
+        if e then
+            local tag = (cp == RESET_CP) and "  [RESET]" or ""
+            log(string.format("  CP%-2d → idx %-5d (%.1f studs)%s", cp, e.idx, e.dist, tag))
+        end
+    end
+
+    S.VerticalZones = detectVerticalZones(Path)
+    log(string.format("Detected %d vertical zones:", #S.VerticalZones))
+    for i, z in ipairs(S.VerticalZones) do
+        local p1, p2 = Path[z.startIdx].p, Path[z.endIdx].p
+        local dY = math.abs(p2.Y - p1.Y)
+        local dH = Vector3.new(p2.X - p1.X, 0, p2.Z - p1.Z).Magnitude
+        log(string.format("  VZ #%d: idx %d-%d dY=%.1f dH=%.1f dur=%.1fs",
+            i, z.startIdx, z.endIdx, dY, dH, Path[z.endIdx].t - Path[z.startIdx].t))
+    end
+
+    S.Jumps = {}
+    local n = #Path
+    local i = 2
+    while i <= n - 1 do
+        local dy = Path[i].p.Y - Path[i-1].p.Y
+        local dt = Path[i].t - Path[i-1].t
+        if dt > 0 and dy/dt > 20 and dy/dt < 200 then
+            S.Jumps[#S.Jumps+1] = { idx = i, fired = false }
+            local stop = Path[i].t + 0.4
+            while i <= n and Path[i].t < stop do i = i + 1 end
+        else
+            i = i + 1
+        end
+    end
+
     Loaded = true
     LoadErr = ""
-    log(string.format("Loaded %d frames (%.1fs), %d jumps.",
-        #Path, Path[#Path].t, #S.Jumps))
     return true
 end
 
+local function refreshVerticalZones()
+    if #Path == 0 then return end
+    S.VerticalZones = detectVerticalZones(Path)
+    log(string.format("Re-detected %d vertical zones with new thresholds.", #S.VerticalZones))
+end
+
+-- ═══════════════════════════════════════════════════════
+-- HELPERS
+-- ═══════════════════════════════════════════════════════
 local function nearestFrame(pos, hintIdx, wide)
     local win = wide and 200 or 30
     local lo = math.max(1, (hintIdx or 1) - win)
@@ -135,9 +270,17 @@ local function pickHorizTarget(fromPos, startIdx, extraSkip, minHoriz)
     return math.min(#Path, start + 60)
 end
 
+local function getCheckpointValue()
+    local ls = LocalPlayer:FindFirstChild("leaderstats")
+    if not ls then return nil end
+    local cp = ls:FindFirstChild("Checkpoint")
+    if not cp then return nil end
+    return tonumber(cp.Value) or 0
+end
+
 local function stopPlayback()
-    log(string.format("Stopped. Frames: %d, Jumps: %d, Escapes: %d",
-        S.Frames, S.JumpCount, S.EscapeCount))
+    log(string.format("Stopped. Frames: %d, Jumps: %d, Escapes: %d, CPs: %d",
+        S.Frames, S.JumpCount, S.EscapeCount, S.RegisteredCount))
     S.Enabled = false
     if S.Conn then S.Conn:Disconnect(); S.Conn = nil end
     if S.MoveConn then S.MoveConn:Disconnect(); S.MoveConn = nil end
@@ -147,9 +290,120 @@ local function stopPlayback()
         if h then h.WalkSpeed = 16; h.JumpPower = 50; h:Move(Vector3.zero) end
     end
     for _, ev in ipairs(S.Jumps) do ev.fired = false end
+    S.CurrentVerticalZone = nil
     S.State = "waiting"
 end
 
+local function beginPause(cpNumber, cpPos, now)
+    S.State           = "pausing"
+    S.PauseCPPos      = cpPos
+    S.PauseCPNumber   = cpNumber
+    S.PauseStartTime  = now
+    S.PausePollAt     = 0
+    S.PauseLastWarn   = now
+    S.PausePhase      = "approach"
+    S.PauseHoldStart  = 0
+    S.SearchAngle     = 0
+    S.SearchCircles   = 0
+    S.SearchLastTick  = now
+    S.MoveDir         = Vector3.zero
+    if cpNumber == RESET_CP then
+        log("[CP-BEGIN] CP22 (RESET) — heading to reset point")
+    else
+        log(string.format("[CP-BEGIN] CP%d", cpNumber))
+    end
+end
+
+local function checkPauseSuccess(cpNow)
+    if cpNow == nil then return false end
+    if S.PauseCPNumber == RESET_CP then return cpNow == 0 end
+    return cpNow >= S.PauseCPNumber
+end
+
+local function completePause(cpNow, now)
+    S.RegisteredCount = S.RegisteredCount + 1
+    local elapsed = now - S.PauseStartTime
+
+    if S.PauseCPNumber == RESET_CP then
+        log(string.format("[CP-OK] CP22 RESET! cp=%d, %.1fs", cpNow, elapsed))
+        S.PauseCPPos, S.PauseCPNumber = nil, nil
+        S.ExpectedCP = 1
+        S.LastProgressAt = now
+        if S.Loop then
+            S.State = "waiting_base_camp"
+            S.ResetWaitStart = now
+            log("[CP22] Waiting for base-camp teleport...")
+        else
+            log("[CP22] Loop off. Stopping.")
+            stopPlayback()
+        end
+        return
+    end
+
+    log(string.format("[CP-OK] CP%d registered! cp=%d, %.1fs (phase=%s, circles=%d)",
+        S.PauseCPNumber, cpNow, elapsed, S.PausePhase, S.SearchCircles))
+    S.ExpectedCP = cpNow + 1
+    S.State      = "following"
+    S.PauseCPPos, S.PauseCPNumber = nil, nil
+    S.LastProgressAt = now
+
+    -- Loop OFF stops after CP21
+    if not S.Loop and cpNow >= 21 then
+        log("[END] Loop off + CP21 → summit reached. Stopping.")
+        stopPlayback()
+        return
+    end
+end
+
+local function reanchorToBaseCamp(now, reason)
+    log(string.format("[REANCHOR] %s → restarting from 0%%", reason))
+    S.TrackIdx        = 1
+    S.LastProgressIdx = 1
+    S.LastProgressAt  = now
+    S.LastEscapeIdx   = 0
+    S.EscapeLevel     = 0
+    S.EscapeCount     = 0
+    S.JumpCount       = 0
+    S.Frames          = 0
+    S.RegisteredCount = 0
+    S.ExpectedCP      = 1
+    S.CurrentVerticalZone = nil
+    for _, ev in ipairs(S.Jumps) do ev.fired = false end
+    S.State = "following"
+end
+
+local function updateVerticalZone(now)
+    local inZone, currentZone = false, nil
+    for _, z in ipairs(S.VerticalZones) do
+        if S.TrackIdx >= z.startIdx and S.TrackIdx <= z.endIdx then
+            inZone = true
+            currentZone = z
+            break
+        end
+    end
+
+    if inZone and not S.CurrentVerticalZone then
+        S.JumpPowerSaved = S.JumpPower
+        S.AltitudeCapSaved = S.AltitudeCap
+        S.JumpPower = 100
+        S.AltitudeCap = 50
+        S.CurrentVerticalZone = currentZone
+        local dY = math.abs(Path[currentZone.endIdx].p.Y - Path[currentZone.startIdx].p.Y)
+        log(string.format("[VERTICAL-IN] idx %d-%d (dY=%.1f). JP %d→100, AltCap %d→50",
+            currentZone.startIdx, currentZone.endIdx, dY,
+            S.JumpPowerSaved, S.AltitudeCapSaved))
+    elseif not inZone and S.CurrentVerticalZone then
+        log(string.format("[VERTICAL-OUT] restore JP=%d AltCap=%d",
+            S.JumpPowerSaved or 100, S.AltitudeCapSaved or 12))
+        S.JumpPower = S.JumpPowerSaved or 100
+        S.AltitudeCap = S.AltitudeCapSaved or 12
+        S.CurrentVerticalZone = nil
+    end
+end
+
+-- ═══════════════════════════════════════════════════════
+-- HEARTBEAT
+-- ═══════════════════════════════════════════════════════
 local function heartbeatBody()
     local now = os.clock()
     if not S.Enabled then return end
@@ -162,9 +416,12 @@ local function heartbeatBody()
 
     local myPos = h.Position
     local state = hh:GetState()
+    local cpNow = getCheckpointValue()
 
+    -- WAITING
     if S.State == "waiting" then
         if (now - S.WaitStart) < 3 then return end
+        if cpNow == nil then return end
         local onGround = (state == Enum.HumanoidStateType.Running
                       or state == Enum.HumanoidStateType.RunningNoPhysics
                       or state == Enum.HumanoidStateType.Landed
@@ -179,61 +436,164 @@ local function heartbeatBody()
             S.TrackIdx = fullNearestFrame(myPos)
             S.LastProgressIdx = S.TrackIdx
             S.LastProgressAt  = now
+            S.ExpectedCP      = cpNow + 1
             S.State = "following"
-            log("Following from idx " .. S.TrackIdx)
+            log(string.format("Following from idx %d. cp=%d, expecting CP%d",
+                S.TrackIdx, cpNow, S.ExpectedCP))
         end
         return
     end
 
+    -- WAITING FOR BASE CAMP
+    if S.State == "waiting_base_camp" then
+        S.MoveDir = Vector3.zero
+        local cp0 = CHECKPOINTS[0]
+        local dist = (myPos - cp0).Magnitude
+
+        if (now - S.PauseLastWarn) > 3 then
+            S.PauseLastWarn = now
+            log(string.format("[CP22-WAIT] at (%.1f,%.1f,%.1f), dist=%.1f, cp=%s",
+                myPos.X, myPos.Y, myPos.Z, dist, tostring(cpNow)))
+        end
+        if dist <= S.ResetArriveDist then
+            reanchorToBaseCamp(now, string.format("arrived (dist=%.1f)", dist)); return
+        end
+        if (now - S.ResetWaitStart) > S.ResetWaitMax then
+            reanchorToBaseCamp(now, string.format("timeout (dist=%.1f)", dist)); return
+        end
+        return
+    end
+
+    -- PAUSING
+    if S.State == "pausing" then
+        S.LastProgressAt = now
+
+        if (now - S.PausePollAt) >= 0.15 then
+            S.PausePollAt = now
+            if checkPauseSuccess(cpNow) then
+                completePause(cpNow, now); return
+            end
+        end
+
+        if (now - S.PauseStartTime) >= S.PauseTimeout then
+            log(string.format("[CP-TIMEOUT] CP%d unresolved in %ds. Aborting.",
+                S.PauseCPNumber, S.PauseTimeout))
+            stopPlayback(); return
+        end
+
+        if (now - S.PauseLastWarn) > 5 then
+            S.PauseLastWarn = now
+            local dist = S.PauseCPPos and (myPos - S.PauseCPPos).Magnitude or -1
+            log(string.format("[CP-WAIT] CP%d %.1fs cp=%s phase=%s circles=%d dist=%.1f",
+                S.PauseCPNumber, now - S.PauseStartTime, tostring(cpNow),
+                S.PausePhase, S.SearchCircles, dist))
+        end
+
+        local cpPos = S.PauseCPPos
+        if not cpPos then S.MoveDir = Vector3.zero; return end
+
+        if S.PausePhase == "approach" then
+            local dist = (myPos - cpPos).Magnitude
+            if dist <= 3 then
+                S.PausePhase    = "hold"
+                S.PauseHoldStart = now
+                S.MoveDir       = Vector3.zero
+                log(string.format("[CP-HOLD] CP%d arrived (dist %.1f). Holding %.1fs.",
+                    S.PauseCPNumber, dist, S.PauseHoldDur))
+            else
+                local delta = cpPos - myPos
+                local horiz = Vector3.new(delta.X, 0, delta.Z)
+                S.MoveDir = horiz.Magnitude > 0.5 and horiz.Unit or Vector3.zero
+            end
+            return
+        end
+
+        if S.PausePhase == "hold" then
+            S.MoveDir = Vector3.zero
+            if (now - S.PauseHoldStart) >= S.PauseHoldDur then
+                S.PausePhase     = "search"
+                S.SearchAngle    = 0
+                S.SearchCircles  = 0
+                S.SearchLastTick = now
+                log(string.format("[CP-SEARCH] CP%d starting circular search", S.PauseCPNumber))
+            end
+            return
+        end
+
+        if S.PausePhase == "search" then
+            local dt = now - S.SearchLastTick
+            S.SearchLastTick = now
+            if dt > 0.25 then dt = 0.25 end
+            S.SearchAngle = S.SearchAngle + S.SearchAngSpeed * dt
+            if S.SearchAngle >= math.pi * 2 then
+                S.SearchAngle = S.SearchAngle - math.pi * 2
+                S.SearchCircles = S.SearchCircles + 1
+                local r = math.min(S.SearchBaseR + S.SearchCircles * S.SearchStepR, S.SearchMaxR)
+                log(string.format("[CP-CIRCLE] CP%d circle %d → radius %.1f",
+                    S.PauseCPNumber, S.SearchCircles, r))
+            end
+            local radius = math.min(S.SearchBaseR + S.SearchCircles * S.SearchStepR, S.SearchMaxR)
+            local desired = Vector3.new(
+                cpPos.X + math.cos(S.SearchAngle) * radius, cpPos.Y,
+                cpPos.Z + math.sin(S.SearchAngle) * radius)
+            local delta = desired - myPos
+            local horiz = Vector3.new(delta.X, 0, delta.Z)
+            S.MoveDir = horiz.Magnitude > 0.8 and horiz.Unit or Vector3.zero
+            return
+        end
+        return
+    end
+
+    -- FOLLOWING
     local wideSearch = (S.EscapeLevel > 0)
     local nearIdx = nearestFrame(myPos, S.TrackIdx, wideSearch)
     if nearIdx > S.TrackIdx then S.TrackIdx = nearIdx end
 
-    -- ═══ TrackIdx progress tracking ═══
     if S.TrackIdx > S.LastProgressIdx then
         S.LastProgressIdx = S.TrackIdx
         S.LastProgressAt  = now
+        if S.EscapeLevel > 0 and (S.TrackIdx - S.LastEscapeIdx) > S.ResetDistance then
+            S.EscapeLevel = 0
+            S.LastEscapeIdx = 0
+        end
+    end
 
-        -- Reset escape level ONLY after significant progress past last escape
-        if S.EscapeLevel > 0 then
-            local framesSinceEscape = S.TrackIdx - S.LastEscapeIdx
-            if framesSinceEscape > S.ResetDistance then
-                S.EscapeLevel = 0
-                S.LastEscapeIdx = 0
-            end
+    updateVerticalZone(now)
+
+    S.ExpectedCP = (cpNow or 0) + 1
+
+    if not S.Loop and (cpNow or 0) >= 21 then
+        log("[END] Loop off + CP21 → stopping at summit.")
+        stopPlayback(); return
+    end
+
+    if S.ExpectedCP <= MAX_CP then
+        local e = S.CPIdxs[S.ExpectedCP]
+        if e and S.TrackIdx >= e.idx - 8 then
+            beginPause(S.ExpectedCP, e.pos, now); return
         end
     end
 
     local stalledFor = now - S.LastProgressAt
     local stallTrigger = tonumber(S.StallTrigger) or 1.0
-    local escapeCooldown = tonumber(S.EscapeCooldown) or 0.6
-    local postLock = tonumber(S.PostEscapeLock) or 1.0
-
-    -- ═══ Escape ═══
     if stalledFor > stallTrigger
-       and (now - S.LastEscapeAt) > escapeCooldown
-       and (now - S.LastEscapeAt) > postLock then
+       and (now - S.LastEscapeAt) > S.EscapeCooldown then
 
         S.EscapeLevel = math.min(S.EscapeLevel + 1, #ESCAPE_DIST)
         local adv = ESCAPE_DIST[S.EscapeLevel]
-
-        -- Find escape target, but skip past any teleport frames
         local targetIdx = math.min(S.TrackIdx + adv, #Path)
-        local escapes = 0
-        while targetIdx < #Path and escapes < 5 do
-            local jump = math.abs(Path[targetIdx + 1].p.Y - Path[targetIdx].p.Y)
-            if jump > 50 then
-                -- Landing spot is right before a teleport; push past it
-                targetIdx = math.min(targetIdx + 30, #Path)
-                escapes = escapes + 1
-            else
-                break
+
+        if S.ExpectedCP <= MAX_CP then
+            local e = S.CPIdxs[S.ExpectedCP]
+            if e and targetIdx > e.idx - 5 then
+                targetIdx = math.max(S.TrackIdx + 10, e.idx - 5)
+                log(string.format("[ESCAPE-CLAMP] clamped to idx %d", targetIdx))
             end
         end
 
         local tpPos = Path[targetIdx].p
         local pathY = Path[S.TrackIdx].p.Y
-        local altOffset = math.clamp(myPos.Y - pathY, 5, 15)   -- cap at 15 studs
+        local altOffset = math.clamp(myPos.Y - pathY, 5, 15)
         local dest = Vector3.new(tpPos.X, tpPos.Y + altOffset, tpPos.Z)
 
         pcall(function() h.CFrame = CFrame.new(dest) end)
@@ -249,29 +609,28 @@ local function heartbeatBody()
         S.LastEscapeIdx   = targetIdx
         S.TrackIdx       = targetIdx
 
-        log(string.format(
-            "[ESCAPE-L%d] stall %.1fs → +%d frames to idx=%d",
-            S.EscapeLevel, stalledFor, adv, targetIdx))
+        log(string.format("[ESCAPE-L%d] stall %.1fs → idx=%d",
+            S.EscapeLevel, stalledFor, targetIdx))
         return
     end
 
+    -- Normal follow
     local pathY = Path[S.TrackIdx].p.Y
     local altAbove = myPos.Y - pathY
 
-    local baseAhead = S.TrackIdx + tonumber(S.LookAhead) or S.TrackIdx + 8
+    local baseAhead = S.TrackIdx + (tonumber(S.LookAhead) or 8)
     local targetIdx = pickHorizTarget(myPos, baseAhead, 0, 1.5)
     local target = Path[targetIdx].p
 
     local delta = target - myPos
     local horiz = Vector3.new(delta.X, 0, delta.Z)
-    if horiz.Magnitude > 0.5 then
-        S.MoveDir = horiz.Unit
-    else
-        S.MoveDir = Vector3.zero
-    end
+    S.MoveDir = horiz.Magnitude > 0.5 and horiz.Unit or Vector3.zero
 
     S.Frames = S.Frames + 1
     if hh.WalkSpeed ~= S.WalkSpeed then hh.WalkSpeed = tonumber(S.WalkSpeed) or 200 end
+    if hh.JumpPower ~= S.JumpPower then
+        pcall(function() hh.UseJumpPower = true; hh.JumpPower = S.JumpPower end)
+    end
 
     local altCap = tonumber(S.AltitudeCap) or 12
     local jumpInterval = tonumber(S.JumpInterval) or 0.18
@@ -293,27 +652,21 @@ local function heartbeatBody()
 
     if S.TrackIdx >= #Path - 3 then
         if S.Loop then
-            S.TrackIdx = fullNearestFrame(myPos)
-            S.LastProgressIdx = S.TrackIdx
-            S.LastProgressAt = now
-            S.EscapeLevel = 0
-            S.LastEscapeIdx = 0
-            for _, ev in ipairs(S.Jumps) do ev.fired = false end
-            return
+            reanchorToBaseCamp(now, "reached end of path"); return
         else
-            log("End."); stopPlayback(); return
+            log("End of path."); stopPlayback(); return
         end
     end
 
     if (now - S.DiagAt) >= 1 then
         S.DiagAt = now
         local pct = math.floor(S.TrackIdx / #Path * 100)
+        local vz = S.CurrentVerticalZone and "VZ" or "--"
         log(string.format(
-            "idx=%d (%d%%) pos=(%.1f,%.1f,%.1f) alt=%+.1f dir=(%.2f,%.2f) stalled=%.1fs L%d esc=%d",
-            S.TrackIdx, pct,
-            myPos.X, myPos.Y, myPos.Z,
-            altAbove, S.MoveDir.X, S.MoveDir.Z,
-            stalledFor, S.EscapeLevel, S.EscapeCount))
+            "idx=%d (%d%%) cp=%s exp=%d done=%d esc=%d stall=%.1fs vz=%s JP=%d alt=%d",
+            S.TrackIdx, pct, tostring(cpNow),
+            S.ExpectedCP, S.RegisteredCount, S.EscapeCount,
+            stalledFor, vz, S.JumpPower, S.AltitudeCap))
     end
 end
 
@@ -339,16 +692,25 @@ local function startPlayback()
     S.LastEscapeAt    = 0
     S.EscapeLevel     = 0
     S.EscapeCount     = 0
+    S.RegisteredCount = 0
+    S.PauseCPPos      = nil
+    S.PauseCPNumber   = nil
+    S.ResetWaitStart  = 0
+    S.CurrentVerticalZone = nil
+    S.JumpPowerSaved  = S.JumpPower
+    S.AltitudeCapSaved = S.AltitudeCap
 
     log("Waiting 3s for map...")
 
     S.MoveConn = RunService.RenderStepped:Connect(function()
-        if not S.Enabled or S.State ~= "following" then return end
+        if not S.Enabled then return end
         local cc = LocalPlayer.Character
         if not cc then return end
         local hhh = cc:FindFirstChildOfClass("Humanoid")
         if not hhh then return end
-        if S.MoveDir.Magnitude > 0.05 then
+        if S.State == "waiting_base_camp" then
+            hhh:Move(Vector3.zero, false)
+        elseif S.MoveDir.Magnitude > 0.05 then
             hhh:Move(S.MoveDir, false)
         else
             hhh:Move(Vector3.zero, false)
@@ -359,20 +721,20 @@ local function startPlayback()
         local ok, err = xpcall(heartbeatBody, function(e)
             return tostring(e) .. "\n" .. debug.traceback("", 2)
         end)
-        if not ok then
-            warn("[AutoSummit] Error:", err)
-        end
+        if not ok then warn("[AutoSummit] Error:", err) end
     end)
 
-    log("Playback started (fast escape).")
+    log("Playback started.")
 end
 
--- ═══ UI ═══
+-- ═══════════════════════════════════════════════════════
+-- UI
+-- ═══════════════════════════════════════════════════════
 local Window = Fluent:CreateWindow({
-    Title       = "Mount LONELY — Auto Summit v37",
-    SubTitle    = "Fast & Smooth Escape",
+    Title       = "Mount LONELY — Auto Summit",
+    SubTitle    = "v44 Polished",
     TabWidth    = 160,
-    Size        = UDim2.fromOffset(540, 540),
+    Size        = UDim2.fromOffset(520, 240),
     Acrylic     = false,
     Theme       = "Neon Purple",
     MinimizeKey = Enum.KeyCode.LeftAlt,
@@ -380,17 +742,17 @@ local Window = Fluent:CreateWindow({
 
 local Tab = Window:AddTab({ Title = "Playback", Icon = "play" })
 
-Tab:AddParagraph({
-    Title   = "v37",
-    Content = "Bigger first escape (50), faster trigger (1s), quicker cooldown (0.6s). Adaptive level reset only after 150 frames progress.",
+local statusPara = Tab:AddParagraph({
+    Title   = "Status",
+    Content = "Initializing...",
 })
-
-local statusPara = Tab:AddParagraph({ Title = "Status", Content = "Initializing..." })
 
 local PlayToggle
 PlayToggle = Tab:AddToggle("PlayToggle", {
-    Title = "▶ Play Path", Default = false,
-    Callback = function(enabled)
+    Title       = "▶ Play Path",
+    Description = "Start auto-summit playback.",
+    Default     = false,
+    Callback    = function(enabled)
         if enabled then
             if not Loaded and not loadData() then
                 Fluent:Notify({ Title = "AutoSummit", Content = "Load failed: " .. LoadErr, Duration = 4 })
@@ -404,26 +766,55 @@ PlayToggle = Tab:AddToggle("PlayToggle", {
     end,
 })
 
-Tab:AddToggle("LoopToggle", { Title = "🔁 Loop", Default = false,
-    Callback = function(e) S.Loop = e end })
+Tab:AddToggle("LoopToggle", {
+    Title = "🔁 Loop (CP22 reset + restart)",
+    Default = false,
+    Callback = function(e) S.Loop = e end,
+})
 
-Tab:AddToggle("JumpToggle", { Title = "🦘 Infinite Jump", Default = true,
-    Callback = function(e) S.JumpEnabled = e end })
+Tab:AddToggle("JumpToggle", {
+    Title = "🦘 Infinite Jump",
+    Default = true,
+    Callback = function(e) S.JumpEnabled = e end,
+})
+
+-- ═══ MOVEMENT SECTION ═══
+Tab:AddParagraph({ Title = "Movement", Content = "" })
 
 Tab:AddSlider("WalkSpeedSlider", {
-    Title = "WalkSpeed", Default = 60, Min = 16, Max = 300, Rounding = 0,
-    Callback = function(v) S.WalkSpeed = tonumber(v) or 200 end,
+    Title = "WalkSpeed", Default = 100, Min = 16, Max = 100, Rounding = 0,
+    Callback = function(v) S.WalkSpeed = tonumber(v) or 100 end,
 })
 
 Tab:AddSlider("JumpPowerSlider", {
-    Title = "JumpPower", Default = 40, Min = 1, Max = 300, Rounding = 0,
-    Callback = function(v) S.JumpPower = tonumber(v) or 100 end,
+    Title = "JumpPower (base)", Default = 100, Min = 50, Max = 300, Rounding = 0,
+    Callback = function(v)
+        S.JumpPower = tonumber(v) or 100
+        if not S.CurrentVerticalZone then S.JumpPowerSaved = S.JumpPower end
+    end,
 })
 
 Tab:AddSlider("AltitudeCapSlider", {
-    Title = "Altitude Cap (studs)", Default = 12, Min = 5, Max = 60, Rounding = 0,
-    Callback = function(v) S.AltitudeCap = tonumber(v) or 12 end,
+    Title = "Altitude Cap (base)", Default = 5, Min = 5, Max = 60, Rounding = 0,
+    Callback = function(v)
+        S.AltitudeCap = tonumber(v) or 12
+        if not S.CurrentVerticalZone then S.AltitudeCapSaved = S.AltitudeCap end
+    end,
 })
+
+Tab:AddSlider("JumpIntervalSlider", {
+    Title = "Jump Interval (s)", Description = "Min gap between jumps.",
+    Default = 0.18, Min = 0.05, Max = 0.6, Rounding = 2,
+    Callback = function(v) S.JumpInterval = tonumber(v) or 0.18 end,
+})
+
+Tab:AddSlider("LookAheadSlider", {
+    Title = "Look-ahead (frames)", Default = 5, Min = 2, Max = 30, Rounding = 0,
+    Callback = function(v) S.LookAhead = tonumber(v) or 8 end,
+})
+
+-- ═══ ESCAPE SECTION ═══
+Tab:AddParagraph({ Title = "Escape / Recovery", Content = "" })
 
 Tab:AddSlider("StallTriggerSlider", {
     Title = "Stall Time (s)", Default = 1.0, Min = 0.4, Max = 5.0, Rounding = 1,
@@ -436,25 +827,110 @@ Tab:AddSlider("EscapeCooldownSlider", {
 })
 
 Tab:AddSlider("ResetDistanceSlider", {
-    Title = "Level Reset Distance (frames)", Description = "Progress needed past last escape to reset level.",
-    Default = 150, Min = 30, Max = 500, Rounding = 0,
+    Title = "Escape Level Reset (frames)", Default = 150, Min = 30, Max = 500, Rounding = 0,
     Callback = function(v) S.ResetDistance = tonumber(v) or 150 end,
 })
 
-Tab:AddSlider("LookAheadSlider", {
-    Title = "Look-ahead (frames)", Default = 8, Min = 2, Max = 30, Rounding = 0,
-    Callback = function(v) S.LookAhead = tonumber(v) or 8 end,
+-- ═══ CHECKPOINT SECTION ═══
+Tab:AddParagraph({ Title = "Checkpoint", Content = "" })
+
+Tab:AddSlider("HoldDurSlider", {
+    Title = "Hold Time (s)", Default = 2.0, Min = 0.5, Max = 8.0, Rounding = 1,
+    Callback = function(v) S.PauseHoldDur = tonumber(v) or 2.0 end,
 })
 
+Tab:AddSlider("SearchBaseRSlider", {
+    Title = "Search Base Radius", Default = 2.0, Min = 1, Max = 8, Rounding = 1,
+    Callback = function(v) S.SearchBaseR = tonumber(v) or 2.0 end,
+})
+
+Tab:AddSlider("SearchStepRSlider", {
+    Title = "Radius Growth/Circle", Default = 2.0, Min = 1, Max = 6, Rounding = 1,
+    Callback = function(v) S.SearchStepR = tonumber(v) or 2.0 end,
+})
+
+Tab:AddSlider("SearchMaxRSlider", {
+    Title = "Max Search Radius", Default = 24.0, Min = 5, Max = 30, Rounding = 1,
+    Callback = function(v) S.SearchMaxR = tonumber(v) or 14.0 end,
+})
+
+Tab:AddSlider("SearchSpeedSlider", {
+    Title = "Orbit Speed (rad/s)", Default = 5.0, Min = 0.5, Max = 8.0, Rounding = 1,
+    Callback = function(v) S.SearchAngSpeed = tonumber(v) or 3.0 end,
+})
+
+Tab:AddSlider("PauseTimeoutSlider", {
+    Title = "Checkpoint Timeout (s)", Default = 60, Min = 20, Max = 180, Rounding = 0,
+    Callback = function(v) S.PauseTimeout = tonumber(v) or 60 end,
+})
+
+Tab:AddSlider("ResetArriveDistSlider", {
+    Title = "Base Arrival Dist (studs)", Default = 40, Min = 10, Max = 100, Rounding = 0,
+    Callback = function(v) S.ResetArriveDist = tonumber(v) or 40 end,
+})
+
+Tab:AddSlider("ResetWaitMaxSlider", {
+    Title = "Base Wait Timeout (s)", Default = 30, Min = 10, Max = 120, Rounding = 0,
+    Callback = function(v) S.ResetWaitMax = tonumber(v) or 30 end,
+})
+
+-- ═══ VERTICAL ZONE SECTION ═══
+Tab:AddParagraph({ Title = "Vertical Zone Detection", Content = "Re-detects zones immediately." })
+
+Tab:AddSlider("VZ_WindowSlider", {
+    Title = "Window (frames)", Default = 40, Min = 10, Max = 120, Rounding = 0,
+    Callback = function(v)
+        S.VZ_Window = tonumber(v) or 40
+        refreshVerticalZones()
+    end,
+})
+
+Tab:AddSlider("VZ_MinDYSlider", {
+    Title = "Min dY (studs)", Default = 25, Min = 10, Max = 100, Rounding = 0,
+    Callback = function(v)
+        S.VZ_MinDY = tonumber(v) or 25
+        refreshVerticalZones()
+    end,
+})
+
+Tab:AddSlider("VZ_MaxDHSlider", {
+    Title = "Max dH (studs)", Default = 15, Min = 3, Max = 60, Rounding = 0,
+    Callback = function(v)
+        S.VZ_MaxDH = tonumber(v) or 15
+        refreshVerticalZones()
+    end,
+})
+
+-- ═══ BUTTONS ═══
 Tab:AddButton({ Title = "🔄 Reload Path", Callback = function()
-    Loaded = false; Path = {}
+    Loaded = false; Path = {}; S.CPIdxs = {}; S.VerticalZones = {}
     if loadData() then
-        Fluent:Notify({ Title = "AutoSummit", Content = "Loaded " .. #Path .. " frames.", Duration = 3 })
+        Fluent:Notify({ Title = "AutoSummit", Content = string.format(
+            "Loaded %d frames, %d VZ.", #Path, #S.VerticalZones), Duration = 4 })
     else
         Fluent:Notify({ Title = "AutoSummit", Content = "Load failed: " .. LoadErr, Duration = 4 })
     end
 end })
 
+Tab:AddButton({ Title = "📐 List Vertical Zones", Callback = function()
+    log("Vertical zones:", #S.VerticalZones)
+    for i, z in ipairs(S.VerticalZones) do
+        local p1, p2 = Path[z.startIdx].p, Path[z.endIdx].p
+        local dY = math.abs(p2.Y - p1.Y)
+        local dH = Vector3.new(p2.X - p1.X, 0, p2.Z - p1.Z).Magnitude
+        log(string.format("  VZ #%d: idx %d-%d dY=%.1f dH=%.1f dur=%.1fs",
+            i, z.startIdx, z.endIdx, dY, dH, Path[z.endIdx].t - Path[z.startIdx].t))
+    end
+    Fluent:Notify({ Title = "AutoSummit", Content = "See F9.", Duration = 3 })
+end })
+
+Tab:AddButton({ Title = "🔍 Show leaderstats.Checkpoint", Callback = function()
+    local v = getCheckpointValue()
+    log("leaderstats.Checkpoint =", tostring(v))
+    Fluent:Notify({ Title = "AutoSummit", Content = "Checkpoint: " .. tostring(v), Duration = 3 })
+end })
+
+-- ═══ STATUS LOOP ═══
 task.spawn(function()
     while true do
         task.wait(0.5)
@@ -462,10 +938,20 @@ task.spawn(function()
             statusPara:SetDesc("Not loaded. " .. LoadErr)
         elseif S.Enabled then
             local pct = math.floor(S.TrackIdx / #Path * 100)
-            statusPara:SetDesc(string.format("▶ %d%% idx=%d L%d esc=%d",
-                pct, S.TrackIdx, S.EscapeLevel, S.EscapeCount))
+            local stateStr = S.State
+            if S.State == "pausing" then
+                local tag = (S.PauseCPNumber == RESET_CP) and "RST" or "CP"
+                stateStr = string.format("%s-%s%d(c%d)", S.PausePhase, tag,
+                    S.PauseCPNumber or 0, S.SearchCircles)
+            elseif S.State == "waiting_base_camp" then
+                stateStr = "AWAIT-BASE"
+            end
+            local vz = S.CurrentVerticalZone and "VZ" or ""
+            statusPara:SetDesc(string.format("▶ %d%% [%s] %s done=%d esc=%d",
+                pct, stateStr, vz, S.RegisteredCount, S.EscapeCount))
         else
-            statusPara:SetDesc(string.format("Idle. %d frames.", #Path))
+            statusPara:SetDesc(string.format("Idle. %d frames, %d VZ.",
+                #Path, #S.VerticalZones))
         end
     end
 end)
@@ -479,4 +965,66 @@ LocalPlayer.CharacterAdded:Connect(function()
     if S.Enabled then task.wait(1); stopPlayback() end
 end)
 
-Fluent:Notify({ Title = "Auto Summit v37", Content = "Fast escape. Watch for [ESCAPE-L#].", Duration = 5 })
+-- ═══════════════════════════════════════════════════════
+-- FLOATING GREEN "G" BUTTON
+-- ═══════════════════════════════════════════════════════
+local existing = CoreGui:FindFirstChild("MobileButtonUI_Summit")
+if existing then existing:Destroy() end
+
+local mobileGui = Instance.new("ScreenGui")
+mobileGui.Name = "MobileButtonUI_Summit"
+mobileGui.Parent = CoreGui
+mobileGui.ResetOnSpawn = false
+
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Name = "Toggle"
+toggleBtn.Parent = mobileGui
+toggleBtn.BackgroundColor3 = Color3.fromRGB(0, 255, 0)
+toggleBtn.Position = UDim2.new(0.5, -25, 0.1, 0)
+toggleBtn.Size = UDim2.new(0, 50, 0, 50)
+toggleBtn.Font = Enum.Font.GothamBold
+toggleBtn.Text = "G"
+toggleBtn.TextColor3 = Color3.fromRGB(0, 0, 0)
+toggleBtn.TextSize = 35
+toggleBtn.Active = true
+toggleBtn.Draggable = true
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(1, 0)
+corner.Parent = toggleBtn
+
+local stroke = Instance.new("UIStroke")
+stroke.Color = Color3.fromRGB(0, 255, 0)
+stroke.Thickness = 1.5
+stroke.Parent = toggleBtn
+
+-- Find the Fluent ScreenGui
+local fluentScreenGui
+task.spawn(function()
+    while not fluentScreenGui do
+        task.wait(0.5)
+        for _, gui in pairs(CoreGui:GetChildren()) do
+            if gui:IsA("ScreenGui") and gui ~= mobileGui then
+                for _, descendant in pairs(gui:GetDescendants()) do
+                    if descendant:IsA("TextLabel") and string.find(descendant.Text, "Mount LONELY") then
+                        fluentScreenGui = gui
+                        break
+                    end
+                end
+            end
+            if fluentScreenGui then break end
+        end
+    end
+end)
+
+toggleBtn.MouseButton1Click:Connect(function()
+    if fluentScreenGui then
+        for _, child in pairs(fluentScreenGui:GetChildren()) do
+            if child:IsA("Frame") or child:IsA("CanvasGroup") then
+                child.Visible = not child.Visible
+            end
+        end
+    end
+end)
+
+Fluent:Notify({ Title = "Auto Summit v44", Content = "Loaded. Green G button toggles menu.", Duration = 6 })
