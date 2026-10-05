@@ -15,11 +15,11 @@ local LocalPlayer = Players.LocalPlayer
 
 local CHECKPOINTS = {
     [0]  = Vector3.new(-1, 8, 86),
-    [1]  = Vector3.new(-122, 100, -1380),
+    [1]  = Vector3.new(-121, 100, -1383),
     [2]  = Vector3.new(515, 113, -1833),
     [3]  = Vector3.new(1148, 18, -1801),
-    [4]  = Vector3.new(2175, 17, -2185),
-    [5]  = Vector3.new(2212, 352, -2450),
+    [4]  = Vector3.new(2166, 18, -2170),
+    [5]  = Vector3.new(2201, 353, -2473),
     [6]  = Vector3.new(1969, 385, -3495),
     [7]  = Vector3.new(1142, 457, -3770),
     [8]  = Vector3.new(423, 409, -3570),
@@ -787,7 +787,7 @@ Tab:AddSlider("WalkSpeedSlider", {
 })
 
 Tab:AddSlider("JumpPowerSlider", {
-    Title = "JumpPower (base)", Default = 100, Min = 50, Max = 300, Rounding = 0,
+    Title = "JumpPower (base)", Default = 40, Min = 10, Max = 300, Rounding = 0,
     Callback = function(v)
         S.JumpPower = tonumber(v) or 100
         if not S.CurrentVerticalZone then S.JumpPowerSaved = S.JumpPower end
@@ -795,7 +795,7 @@ Tab:AddSlider("JumpPowerSlider", {
 })
 
 Tab:AddSlider("AltitudeCapSlider", {
-    Title = "Altitude Cap (base)", Default = 5, Min = 5, Max = 60, Rounding = 0,
+    Title = "Altitude Cap (base)", Default = 1, Min = 1, Max = 60, Rounding = 0,
     Callback = function(v)
         S.AltitudeCap = tonumber(v) or 12
         if not S.CurrentVerticalZone then S.AltitudeCapSaved = S.AltitudeCap end
@@ -855,8 +855,8 @@ Tab:AddSlider("SearchMaxRSlider", {
 })
 
 Tab:AddSlider("SearchSpeedSlider", {
-    Title = "Orbit Speed (rad/s)", Default = 5.0, Min = 0.5, Max = 8.0, Rounding = 1,
-    Callback = function(v) S.SearchAngSpeed = tonumber(v) or 3.0 end,
+    Title = "Orbit Speed (rad/s)", Default = 10.0, Min = 0.5, Max = 10.0, Rounding = 1,
+    Callback = function(v) S.SearchAngSpeed = tonumber(v) or 10.0 end,
 })
 
 Tab:AddSlider("PauseTimeoutSlider", {
